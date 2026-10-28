@@ -5,7 +5,9 @@ from __future__ import annotations
 import sqlite3
 import json
 import hashlib
+import math
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
@@ -86,7 +88,7 @@ st.markdown(
 
 PAGE_DESCRIPTIONS = {
     "Overview": "Local system health and recorded activity across the simulated sites.",
-    "Live Detection": "Run the configured PPE model locally on a webcam snapshot, image, or sampled video clip.",
+    "Live Detection": "Test zone transitions on a local OpenCV webcam, or run the configured PPE model on local media.",
     "Incidents": "Review only events produced by the detector and configured rules.",
     "Human Feedback": "Supervisor decisions are stored locally and linked to the audit trail.",
     "Dataset Explorer": "Inspect the configured dataset and its reproducible simulated-site partitions.",
@@ -187,6 +189,15 @@ for key, (heading, options) in NAV_GROUPS.items():
             width="stretch",
         )
 page = st.session_state.active_page
+webcam_capture = st.session_state.get("webcam_capture")
+if webcam_capture is not None and (
+    page != "Live Detection"
+    or st.session_state.get("detection_backend") != "OpenCV webcam"
+):
+    webcam_capture.release()
+    st.session_state.pop("webcam_capture", None)
+    st.session_state.pop("webcam_zone_processor", None)
+    st.session_state.pop("webcam_model", None)
 if "demo_federation_online" not in st.session_state:
     st.session_state.demo_federation_online = settings.federation_online
 federation_online = st.sidebar.toggle(
@@ -203,11 +214,11 @@ if page == "Overview":
     st.info("Factory A/B/C are simulated federated sites on this laptop.")
     with st.expander("Start the viva demo", expanded=True):
         st.write("1. Dataset Explorer → Training → Evaluation: inspect real local data and saved experiments.")
-        st.write("2. Live Detection: use a permitted webcam still, uploaded video or image. Only save actual returned events.")
+        st.write("2. Live Detection: test zone transitions on a local OpenCV webcam, then use an active PPE model for real inference.")
         st.write("3. Human Feedback → AI Copilot → Analytics: review, explain locally and inspect recorded alerts.")
         st.write("4. Federated Learning → Privacy Center → Model Versions: inspect separate recorded experiments and their scope.")
         st.write("5. Audit Integrity → Settings: verify the chain; demonstrate offline queuing and explicit sync only with a configured receiver.")
-        st.warning("Weak experimental PPE model. No prerecorded legal clip is bundled; continuous video/RTSP is not implemented. Missing events stay empty—no fake demo incidents.")
+        st.warning("Experimental PPE model. The OpenCV webcam preview is local and is not safety-grade; RTSP input is not implemented. Missing events stay empty—no fake demo incidents.")
 elif page == "Live Detection":
     summary = load_artifact("ppe_demo_summary.json")
     fallback_model = settings.project_root / str(summary.get("best_artifact")) if summary else None
@@ -216,9 +227,243 @@ elif page == "Live Detection":
         fallback_model,
         project_root=settings.project_root,
     )
-    status = "REAL model output — experimental safety workflow" if model_path and model_path.exists() else "DISABLED — no local PPE artifact"
+    model_available = bool(model_path and model_path.exists())
+    default_backend = "Real PPE model" if model_available else "OpenCV webcam"
+    backend_options = ["OpenCV webcam", "Simulated zone demo"]
+    if model_available:
+        backend_options.append("Real PPE model")
+    if st.session_state.get("detection_backend") not in backend_options:
+        st.session_state.detection_backend = default_backend
+    selected_backend = st.session_state.get("detection_backend", default_backend)
+    if selected_backend == "Simulated zone demo":
+        status = "SIMULATED TEST STATE — no model inference"
+    elif selected_backend == "OpenCV webcam":
+        status = "LIVE CAMERA — synthetic zone input" if not model_available else "LIVE CAMERA — choose processing mode"
+    else:
+        status = "REAL model output — experimental safety workflow"
     title("Live Detection", status)
-    st.write("All inference runs locally. Video clips are sampled at one frame per second, for at most the first 30 seconds.")
+    st.write("Real inference runs locally. Uploaded-video analysis is bounded to the first 30 seconds.")
+    st.radio(
+        "Detection source",
+        backend_options,
+        index=backend_options.index(selected_backend),
+        key="detection_backend",
+        horizontal=True,
+        help="OpenCV webcam input is processed locally. Synthetic positions test only zone rules; real inference requires an active PPE model.",
+    )
+    if st.session_state.detection_backend == "OpenCV webcam":
+        st.subheader("Live OpenCV webcam zone test")
+        st.warning(
+            "Camera frames stay local and are not saved. Without an active PPE model, the person box is synthetic "
+            "and controlled with the arrow buttons; this does not detect people or PPE."
+        )
+        webcam_modes = ["Synthetic test person"]
+        if model_available:
+            webcam_modes.append("Real PPE model")
+        if st.session_state.get("webcam_engine") not in webcam_modes:
+            st.session_state.webcam_engine = webcam_modes[0]
+        st.radio(
+            "Webcam processing",
+            webcam_modes,
+            key="webcam_engine",
+            horizontal=True,
+            help="The real-model choice uses the same live camera and zone tracker when a compatible model is active.",
+        )
+        webcam_boundary = st.slider(
+            "Live left/danger boundary (% of frame width)", 10, 90, 50, 1, key="webcam_zone_boundary"
+        ) / 100
+        webcam_index = st.number_input("OpenCV camera index", min_value=0, max_value=10, value=0, step=1)
+        webcam_engine = st.session_state.webcam_engine
+        webcam_model = None
+        webcam_confidence = 0.25
+        if webcam_engine == "Real PPE model":
+            webcam_confidence = st.slider("PPE model confidence", 0.05, 0.95, 0.25, 0.05)
+            st.caption(f"Active PPE model: {active_model['version_id'] if active_model else 'local checkpoint'}")
+            model_identity = (str(model_path), model_path.stat().st_mtime_ns)
+            if st.session_state.get("webcam_model_identity") != model_identity:
+                st.session_state.pop("webcam_model", None)
+                st.session_state.webcam_model_identity = model_identity
+            try:
+                if st.session_state.get("webcam_model") is None:
+                    from detector.ultralytics_adapter import load_ppe_model
+
+                    st.session_state.webcam_model = load_ppe_model(model_path)
+                webcam_model = st.session_state.webcam_model
+            except Exception as exc:
+                st.error(f"Could not load the active PPE model for webcam inference: {exc}")
+
+        config_key = (webcam_boundary, webcam_engine, model_path, webcam_confidence)
+        if st.session_state.get("webcam_zone_config") != config_key:
+            st.session_state.webcam_zone_config = config_key
+            st.session_state.pop("webcam_zone_processor", None)
+        button_columns = st.columns(3)
+        with button_columns[0]:
+            start_webcam = st.button(
+                "Start webcam",
+                type="primary",
+                disabled=st.session_state.get("webcam_capture") is not None
+                or (webcam_engine == "Real PPE model" and webcam_model is None),
+            )
+        with button_columns[1]:
+            stop_webcam = st.button("Stop webcam", disabled=st.session_state.get("webcam_capture") is None)
+        if start_webcam:
+            try:
+                from edge.webcam_zone import WebcamZoneProcessor, open_webcam
+
+                st.session_state.webcam_capture = open_webcam(int(webcam_index))
+                st.session_state.webcam_zone_processor = WebcamZoneProcessor(boundary=webcam_boundary)
+                st.session_state.webcam_zone_config = config_key
+                st.session_state.webcam_simulated_center_x = 0.2
+                st.session_state.webcam_events = []
+            except RuntimeError as exc:
+                st.error(str(exc))
+        if stop_webcam:
+            active_capture = st.session_state.pop("webcam_capture", None)
+            if active_capture is not None:
+                active_capture.release()
+            st.session_state.pop("webcam_zone_processor", None)
+            st.session_state.pop("webcam_model", None)
+
+        if webcam_engine == "Synthetic test person":
+            move_columns = st.columns(2)
+            with move_columns[0]:
+                if st.button("← Move synthetic person left", disabled=st.session_state.get("webcam_capture") is None):
+                    st.session_state.webcam_simulated_center_x = max(
+                        0.05, st.session_state.get("webcam_simulated_center_x", 0.2) - 0.1
+                    )
+            with move_columns[1]:
+                if st.button("Move synthetic person right →", disabled=st.session_state.get("webcam_capture") is None):
+                    st.session_state.webcam_simulated_center_x = min(
+                        0.95, st.session_state.get("webcam_simulated_center_x", 0.2) + 0.1
+                    )
+            st.caption("Move the marker across the boundary, then let a few camera frames confirm the transition.")
+
+        if st.session_state.get("webcam_capture") is not None:
+            if st.session_state.get("webcam_zone_processor") is None:
+                from edge.webcam_zone import WebcamZoneProcessor
+
+                st.session_state.webcam_zone_processor = WebcamZoneProcessor(boundary=webcam_boundary)
+
+            @st.fragment(run_every="500ms")
+            def render_webcam_preview():
+                import cv2
+
+                capture = st.session_state.get("webcam_capture")
+                if capture is None:
+                    st.info("Webcam stopped.")
+                    return
+                ok, frame_bgr = capture.read()
+                if not ok:
+                    capture.release()
+                    st.session_state.pop("webcam_capture", None)
+                    st.error("OpenCV could not read a frame. Check the camera connection and restart the webcam.")
+                    return
+                processor = st.session_state.webcam_zone_processor
+                try:
+                    if webcam_engine == "Synthetic test person":
+                        preview_bgr = processor.process_frame(
+                            frame_bgr,
+                            synthetic_center_x=st.session_state.get("webcam_simulated_center_x", 0.2),
+                        )
+                    elif webcam_model is not None:
+                        preview_bgr = processor.process_frame(
+                            frame_bgr,
+                            model=webcam_model,
+                            confidence=webcam_confidence,
+                        )
+                    else:
+                        st.error("No PPE model is available for this webcam mode.")
+                        return
+                except Exception as exc:
+                    st.error(f"Webcam processing failed ({type(exc).__name__}): {exc}")
+                    return
+                st.image(cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB), channels="RGB", width="stretch")
+                st.session_state.webcam_events = list(processor.events)
+                if st.session_state.webcam_events:
+                    st.subheader("Session-only webcam zone transitions")
+                    st.dataframe(
+                        [
+                            {
+                                "SIMULATED event" if item.track_id == "SIM-01" else "Model event": item.event_type,
+                                "track ID": item.track_id,
+                                "previous zone": item.previous_zone,
+                                "current zone": item.current_zone,
+                                "elapsed (s)": round(item.elapsed_seconds, 2),
+                                "danger duration (s)": (
+                                    round(item.danger_duration_seconds, 2)
+                                    if item.danger_duration_seconds is not None else None
+                                ),
+                                "timestamp": item.timestamp,
+                            }
+                            for item in st.session_state.webcam_events[-20:]
+                        ],
+                        width="stretch",
+                    )
+
+            render_webcam_preview()
+            st.info(
+                "Webcam previews and transitions are held only in this Streamlit session. They are not written "
+                "to SQLite, Incidents, Analytics, evidence storage, audit, or the offline queue."
+            )
+        else:
+            st.info("Start the local webcam to begin the live zone preview.")
+        st.stop()
+    if st.session_state.detection_backend == "Simulated zone demo":
+        st.warning(
+            "SIMULATED INPUT — no PPE model is loaded and no computer-vision detections are being made. "
+            "The synthetic person and events below are only for testing zone rendering and transition UI."
+        )
+        simulated_boundary = st.slider(
+            "Simulated left/danger boundary (% of frame width)", 10, 90, 50, 1, key="simulated_zone_boundary"
+        ) / 100
+        if st.button("Run simulated left → danger → left sequence", type="primary"):
+            from edge.zone_demo import run_simulated_zone_demo
+
+            st.session_state.simulated_zone_run = run_simulated_zone_demo(simulated_boundary)
+        simulated_run = st.session_state.get("simulated_zone_run")
+        if simulated_run is not None:
+            st.caption(
+                f"SIMULATED state · boundary {simulated_run.boundary:.0%} · "
+                f"{len(simulated_run.frames)} synthetic samples · temporary tracking ID SIM-01"
+            )
+            frame_columns = st.columns(3)
+            for index, frame in enumerate(simulated_run.frames):
+                with frame_columns[index % len(frame_columns)]:
+                    st.image(
+                        frame.annotated_image,
+                        caption=f"SIMULATED · t={frame.elapsed_seconds:.1f}s · {frame.zone}",
+                        width="stretch",
+                    )
+            st.subheader("Simulated zone-event history")
+            st.dataframe(
+                [
+                    {
+                        "SIMULATED event": item.event_type,
+                        "track ID": item.track_id,
+                        "previous zone": item.previous_zone,
+                        "current zone": item.current_zone,
+                        "clip offset (s)": item.elapsed_seconds,
+                        "danger duration (s)": item.danger_duration_seconds,
+                        "timestamp (synthetic)": item.timestamp,
+                    }
+                    for item in simulated_run.events
+                ],
+                width="stretch",
+            )
+            st.info(
+                "These synthetic rows exist only in this browser session. They are not written to SQLite, "
+                "Incidents, Analytics, evidence storage, the audit log, or the offline queue."
+            )
+        else:
+            st.caption("Run the deterministic sequence to preview two transitions: entry to danger, then return to left.")
+        st.stop()
+    if not model_available:
+        st.warning(
+            "No local PPE artifact is available. Add and activate a compatible PPE checkpoint to run real image/video inference. "
+            "The simulated zone demo above remains separate and cannot test detector accuracy."
+        )
+        st.stop()
+    st.write("Real detector mode: video sampling is configurable and capped at the first 30 seconds.")
     if active_model:
         st.caption(f"Active PPE model version: {active_model['version_id']} · selected locally in Model Versions")
         imported = imported_model_details(settings.project_root, active_model)
@@ -234,6 +479,7 @@ elif page == "Live Detection":
             st.session_state.video_analysis = None
             st.session_state.video_input_digest = None
             st.session_state.video_recorded_frames = set()
+            st.session_state.video_analysis_config = None
         import io
         from PIL import Image, ImageDraw
 
@@ -242,9 +488,25 @@ elif page == "Live Detection":
         site_id = st.selectbox("Demo site (simulated)", list(sites), format_func=lambda item: sites[item])
         camera_id = f"{site_id}-camera-1"
         zone_enabled = st.checkbox("Experimental tracked-person restricted zone (sampled video only)")
+        vertical_zone_enabled = st.checkbox(
+            "Experimental automatic left/danger transitions (sampled video only)"
+        )
+        zone_boundary = 0.5
+        zone_hysteresis = 0.02
+        if vertical_zone_enabled:
+            zone_boundary = st.slider(
+                "Left/danger boundary (% of frame width)", 10, 90, 50, 1
+            ) / 100
+            max_hysteresis = min(round(zone_boundary * 100), round((1 - zone_boundary) * 100)) - 1
+            zone_hysteresis = st.slider(
+                "Boundary hysteresis (%)", 0, max_hysteresis, min(2, max_hysteresis), 1
+            ) / 100
         zone_polygon = None
         zone_id = "restricted-demo-zone"
         zone_config_valid = True
+        if zone_enabled and vertical_zone_enabled:
+            zone_config_valid = False
+            st.error("Choose either the polygon-entry rule or left/danger transitions for a video analysis.")
         if zone_enabled:
             from detector.geometry import parse_normalized_polygon
 
@@ -262,8 +524,33 @@ elif page == "Live Detection":
             except ValueError as exc:
                 zone_config_valid = False
                 st.error(str(exc))
-            st.warning("Experimental low-rate tracking: only observed outside-to-inside person transitions are eligible. This does not establish production-grade tracking or safety performance.")
+            st.warning("Experimental low-rate polygon tracking: only confirmed sampled outside-to-inside person transitions are eligible.")
+        if vertical_zone_enabled:
+            st.warning(
+                "Experimental sampled-video rule only. A transition is confirmed across consecutive sampled frames; "
+                "initially observed danger-zone occupants are not logged as entries."
+            )
         input_mode = st.radio("Input source", ["Webcam snapshot", "Upload image", "Upload video"], horizontal=True)
+        sample_interval_seconds = 1.0
+        if input_mode == "Upload video":
+            sample_interval_seconds = st.slider(
+                "Frame sampling interval (seconds)", 0.25, 5.0, 1.0, 0.25
+            )
+        analysis_config = (
+            site_id,
+            camera_id,
+            zone_enabled,
+            tuple(zone_polygon or ()),
+            vertical_zone_enabled,
+            zone_boundary,
+            zone_hysteresis,
+            sample_interval_seconds,
+            zone_id,
+            model_identity,
+        )
+        if st.session_state.get("video_analysis_config") not in (None, analysis_config):
+            st.session_state.video_analysis = None
+            st.session_state.video_recorded_frames = set()
         captured = st.camera_input("Take a local webcam snapshot") if input_mode == "Webcam snapshot" else None
         uploaded = st.file_uploader("Choose a local image", type=["jpg", "jpeg", "png", "webp"], key="ppe_image_upload") if input_mode == "Upload image" else None
         video_upload = st.file_uploader("Choose a local video (MP4, MOV, AVI, MKV; maximum 100 MB)", type=["mp4", "mov", "avi", "mkv"], key="ppe_video_upload") if input_mode == "Upload video" else None
@@ -278,11 +565,13 @@ elif page == "Live Detection":
                     st.session_state.video_input_digest = video_digest
                     st.session_state.video_analysis = None
                     st.session_state.video_recorded_frames = set()
+                    st.session_state.video_analysis_config = None
                 if st.button("Analyze video locally", type="primary", disabled=not zone_config_valid):
                     temporary_path = None
                     try:
                         from detector.ultralytics_adapter import load_ppe_model
-                        from edge.video_inference import analyze_local_video
+                        from edge.video_inference import analyze_local_video, record_video_zone_transitions
+                        from audit.hash_chain import append_audit
 
                         with tempfile.NamedTemporaryFile(suffix=Path(video_upload.name).suffix, delete=False) as handle:
                             handle.write(video_bytes)
@@ -291,11 +580,50 @@ elif page == "Live Detection":
                             analysis = analyze_local_video(
                                 temporary_path,
                                 load_ppe_model(model_path),
+                                interval_seconds=sample_interval_seconds,
+                                max_frames=math.ceil(30 / sample_interval_seconds),
                                 zone_polygon=zone_polygon if zone_enabled else None,
                                 zone_id=zone_id,
+                                zone_boundary=zone_boundary if vertical_zone_enabled else None,
+                                zone_hysteresis=zone_hysteresis,
                             )
+                        append_audit(settings.db_path, "video.analysis.completed", {
+                            "site_id": site_id,
+                            "camera_id": camera_id,
+                            "sampled_frames": len(analysis.frames),
+                            "sample_interval_seconds": analysis.sample_interval_seconds,
+                            "clip_duration_seconds": analysis.duration_seconds,
+                            "zone_mode": "vertical" if vertical_zone_enabled else "polygon" if zone_enabled else "disabled",
+                        })
+                        if vertical_zone_enabled:
+                            created = 0
+                            for frame in analysis.frames:
+                                created += len(record_video_zone_transitions(
+                                    db_path=settings.db_path,
+                                    frame=frame,
+                                    site_id=site_id,
+                                    camera_id=camera_id,
+                                    evidence_dir=settings.evidence_dir,
+                                    federation_online=federation_online,
+                                    source_key_prefix=hashlib.sha256(
+                                        repr((video_digest, analysis_config)).encode("utf-8")
+                                    ).hexdigest(),
+                                ))
+                            if created:
+                                st.success(
+                                    f"Automatically recorded {created} confirmed zone transition event(s). "
+                                    "Review their experimental status on Incidents."
+                                )
                         st.session_state.video_analysis = analysis
+                        st.session_state.video_analysis_config = analysis_config
                     except Exception as exc:
+                        from audit.hash_chain import append_audit
+
+                        append_audit(settings.db_path, "video.analysis.failed", {
+                            "site_id": site_id,
+                            "camera_id": camera_id,
+                            "error_type": type(exc).__name__,
+                        })
                         st.session_state.video_analysis = None
                         st.error(f"Local video analysis unavailable: {exc}")
                     finally:
@@ -303,19 +631,40 @@ elif page == "Live Detection":
                             temporary_path.unlink(missing_ok=True)
 
                 analysis = st.session_state.get("video_analysis")
-                if analysis is not None and st.session_state.get("video_input_digest") == video_digest:
+                if (
+                    analysis is not None
+                    and st.session_state.get("video_input_digest") == video_digest
+                    and st.session_state.get("video_analysis_config") == analysis_config
+                ):
                     st.caption(
-                        f"Analyzed {len(analysis.frames)} sampled frames at {analysis.fps:.2f} FPS. "
+                        f"Analyzed {len(analysis.frames)} sampled frames at {analysis.sample_interval_seconds:.2f}s intervals "
+                        f"from video recorded at {analysis.fps:.2f} FPS. "
                         f"Container duration: {analysis.duration_seconds:.1f}s. The decoder's temporary copy was deleted; the upload remains in this local Streamlit session until cleared or closed."
                     )
                     if analysis.truncated:
                         st.warning("Only the first 30 seconds were sampled in this demo; later frames were not analyzed.")
+                    if analysis.zone_boundary is not None:
+                        transition_count = sum(len(frame.zone_transitions) for frame in analysis.frames)
+                        latest = analysis.frames[-1]
+                        left_col, danger_col, events_col = st.columns(3)
+                        left_col.metric("People tracked in LEFT zone", latest.left_count)
+                        danger_col.metric("People tracked in DANGER zone", latest.danger_count)
+                        events_col.metric("Confirmed transitions in clip", transition_count)
+                        st.caption(
+                            "Counts and IDs are from the final sampled frame, not a live feed. "
+                            "Tracked IDs are temporary model tracker IDs and are not identity."
+                        )
                     qualifying = []
                     qualifying_zone = []
                     for index, frame in enumerate(analysis.frames):
                         violations = [d for d in frame.detections if d.label.strip().lower() in {"no_helmet", "no_vest", "no_gloves", "no_boots", "no_goggle"}]
                         with st.expander(f"Sample at {frame.elapsed_seconds:.1f}s · {len(frame.detections)} detection(s)", expanded=bool(violations)):
                             st.image(frame.preview_jpeg, caption="Actual model output for this sampled frame", width="stretch")
+                            if frame.tracked_zones:
+                                st.caption(
+                                    "Tracked person zones: "
+                                    + ", ".join(f"ID {track_id}: {zone}" for track_id, zone in frame.tracked_zones)
+                                )
                             st.json([d.__dict__ for d in frame.detections])
                             if not frame.detections:
                                 st.caption("No detections returned for this frame; no boxes or events are fabricated.")
@@ -336,6 +685,11 @@ elif page == "Live Detection":
                                 qualifying_zone.append((index, entry_index, frame, entry))
                     if zone_enabled:
                         st.info("Zone entry checks require actual person-class tracker IDs. The clip is sampled at only one frame per second, so missed transitions are possible; initial observations already inside the polygon are not treated as entry.")
+                    if analysis.zone_boundary is not None:
+                        st.info(
+                            "Confirmed left/danger transitions were recorded automatically from this local sample. "
+                            "No events are inferred from still images, missing track observations, or a person first seen in the danger zone."
+                        )
                     if (qualifying or qualifying_zone) and st.button("Save selected video incident(s) locally"):
                         from edge.video_inference import record_selected_video_frame
 
@@ -374,7 +728,10 @@ elif page == "Live Detection":
                                 st.info("Only incident metadata was queued locally; source video and evidence were not queued.")
                         else:
                             st.info("No supported PPE violation was available to save.")
-                    st.info("PPE results are frame-level and have no cross-frame deduplication. Zone entries are experimental and require sampled person-tracker IDs. Only explicitly selected, rule-qualified results are saved.")
+                    st.info(
+                        "PPE results are frame-level and must be explicitly selected. Polygon entries also require selection; "
+                        "confirmed vertical left/danger transitions are recorded automatically. All zone tracking is experimental."
+                    )
         elif media is not None and st.button("Run local detection"):
             suffix = Path(getattr(media, "name", "capture.jpg")).suffix or ".jpg"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
@@ -414,14 +771,70 @@ elif page == "Live Detection":
                 st.error(f"PPE inference unavailable: {exc}")
             finally:
                 temporary_path.unlink(missing_ok=True)
-    else:
-        st.warning("No local demo artifact is available. A generic person model will not be labeled as helmet/vest detection.")
     st.caption("Raw images/videos are never stored in SQLite or federated. Video upload bytes stay in local session memory until cleared/closed; its decoder temp file is removed after analysis. Selected still evidence is saved locally; only incident metadata is queued while offline.")
 elif page == "Incidents":
     title("Incidents")
     with sqlite3.connect(settings.db_path) as conn:
-        rows = conn.execute("SELECT event_id, site_id, camera_id, event_type, timestamp, status, feedback FROM incidents ORDER BY created_at DESC").fetchall()
-    st.dataframe(rows, width="stretch", column_config={"event_id": "Event ID"})
+        zone_metrics = conn.execute(
+            """SELECT
+                SUM(CASE WHEN event_type = 'DANGER_ZONE_ENTRY' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN event_type = 'DANGER_ZONE_ENTRY' AND zone_status = 'active' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN event_type = 'LEFT_ZONE_ENTRY' THEN 1 ELSE 0 END)
+            FROM incidents"""
+        ).fetchone()
+        cameras = [row[0] for row in conn.execute("SELECT DISTINCT camera_id FROM incidents ORDER BY camera_id")]
+        event_types = [row[0] for row in conn.execute("SELECT DISTINCT event_type FROM incidents ORDER BY event_type")]
+        severities = [row[0] for row in conn.execute("SELECT DISTINCT severity FROM incidents WHERE severity IS NOT NULL ORDER BY severity")]
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Danger-zone entries", int(zone_metrics[0] or 0))
+    metric_cols[1].metric("Active danger incidents", int(zone_metrics[1] or 0))
+    metric_cols[2].metric("Returns to left zone", int(zone_metrics[2] or 0))
+    filter_cols = st.columns(4)
+    selected_camera = filter_cols[0].selectbox("Camera", ["All", *cameras])
+    selected_event_type = filter_cols[1].selectbox("Event type", ["All", *event_types])
+    selected_severity = filter_cols[2].selectbox("Severity", ["All", *severities])
+    filter_dates = filter_cols[3].checkbox("Filter UTC date")
+    where = []
+    values = []
+    if selected_camera != "All":
+        where.append("camera_id = ?")
+        values.append(selected_camera)
+    if selected_event_type != "All":
+        where.append("event_type = ?")
+        values.append(selected_event_type)
+    if selected_severity != "All":
+        where.append("severity = ?")
+        values.append(selected_severity)
+    if filter_dates:
+        selected_dates = st.date_input("UTC date range", value=(date.today(), date.today()))
+        if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
+            where.append("date(timestamp) BETWEEN ? AND ?")
+            values.extend((selected_dates[0].isoformat(), selected_dates[1].isoformat()))
+    query = """SELECT event_id, site_id, camera_id, event_type, timestamp, person_id, status, feedback,
+        previous_zone, current_zone, video_timestamp_seconds, zone_duration_seconds,
+        zone_exited_at, zone_status, severity
+        FROM incidents"""
+    if where:
+        query += " WHERE " + " AND ".join(where)
+    query += " ORDER BY created_at DESC"
+    with sqlite3.connect(settings.db_path) as conn:
+        rows = conn.execute(query, values).fetchall()
+        evidence_rows = conn.execute(
+            """SELECT event_id, event_type, timestamp, person_id, evidence_path FROM incidents"""
+            + (" WHERE " + " AND ".join(where) if where else "")
+            + " ORDER BY created_at DESC LIMIT 8",
+            values,
+        ).fetchall()
+    st.dataframe(
+        rows,
+        width="stretch",
+        column_config={"event_id": "Event ID", "video_timestamp_seconds": st.column_config.NumberColumn("Clip time (s)", format="%.2f")},
+    )
+    saved_evidence = [(event, Path(path)) for event, _kind, _timestamp, _person, path in evidence_rows if path and Path(path).is_file()]
+    if saved_evidence:
+        with st.expander("Recent local event snapshots"):
+            for event_id, image_path in saved_evidence:
+                st.image(image_path, caption=f"Event {event_id[:8]} · local snapshot", width="stretch")
     if rows:
         with sqlite3.connect(settings.db_path) as conn:
             incidents = conn.execute("SELECT event_id, event_type, site_id, ppe_status, zone_id FROM incidents ORDER BY created_at DESC").fetchall()
